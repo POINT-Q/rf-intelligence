@@ -1,0 +1,17 @@
+name = "rf-intelligence"
+main = "src/index.js"
+compatibility_date = "2026-11-13"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rf-intelligence-db"
+database_id = "5882f156-009d-4cf3-8a16-18f98abae819"
+
+[triggers]
+# 08:30 Asia/Shanghai = 00:30 UTC
+crons = ["30 0 * * *"]
