@@ -1,8 +1,12 @@
+// 新闻源：优先协议组织（标准组织）与国内一手行业媒体，不再使用 Google News 二手聚合。
+// - ETSI（欧洲电信标准协会）：官方 RSS，条目含真实发布时间 pubDate。
+// - C114 通信网：国内权威通信行业媒体，官方 RSS 稳定；但其 feed 不含 pubDate，
+//   这类条目的 published_at 留空(null)，前端按"收录时间"展示，避免把抓取时间伪装成发布时间。
 const FEEDS = [
-  { name: "RF & Semiconductor", url: "https://news.google.com/rss/search?q=RF+front+end+PA+FEM+filter+antenna&hl=en-US&gl=US&ceid=US:en" },
-  { name: "Wireless & 5G/6G", url: "https://news.google.com/rss/search?q=5G-Advanced+6G+NTN+wireless+通信&hl=en-US&gl=US&ceid=US:en" },
-  { name: "Professional Communications", url: "https://news.google.com/rss/search?q=PoC+radio+professional+mobile+radio+mission+critical+communications&hl=en-US&gl=US&ceid=US:en" },
-  { name: "Emerging RF", url: "https://news.google.com/rss/search?q=UWB+Wi-Fi+HaLow+LoRa+RF+sensing&hl=en-US&gl=US&ceid=US:en" }
+  { name: "ETSI 标准动态", url: "https://www.etsi.org/newsroom/feed/", maxItems: 8 },
+  { name: "C114 设备商", url: "https://www.c114.com.cn/rss/rss_news_18.xml", maxItems: 6 },
+  { name: "C114 运营商", url: "https://www.c114.com.cn/rss/rss_news_21.xml", maxItems: 6 },
+  { name: "C114 政策监管", url: "https://www.c114.com.cn/rss/rss_news_550.xml", maxItems: 6 }
 ];
 
 const CATEGORIES = ["RF前端", "天线技术", "通信技术", "专业通信", "新兴技术", "产业竞争", "行业动态"];
@@ -27,6 +31,18 @@ export default {
         recent: Number(recentRow?.c || 0),
         analyzed: Number(analyzedRow?.c || 0)
       });
+    }
+
+    // 手动触发采集：调试用，不用等 Cron。
+    // - 加 &dry=1 为试跑：只测每个源是否可达、能解析出几条，不调 AI、不写库、不花钱，秒级返回。
+    // - 不带 dry 则真实采集入库。用 key 做简单保护，可用环境变量 COLLECT_TOKEN 覆盖默认值。
+    if (url.pathname === "/api/collect") {
+      const key = url.searchParams.get("key") || "";
+      const expect = env.COLLECT_TOKEN || "rfintel-debug-2026";
+      if (key !== expect) return json({ error: "unauthorized" }, 401);
+      const dry = url.searchParams.get("dry") === "1";
+      const report = await collectAndAnalyze(env, { dry });
+      return json({ ok: true, dry, ...report });
     }
 
     if (url.pathname === "/api/news") {
@@ -66,20 +82,47 @@ export default {
   }
 };
 
-async function collectAndAnalyze(env) {
+async function collectAndAnalyze(env, opts = {}) {
+  const dry = !!opts.dry;
+  const report = { mode: dry ? "dry" : "live", feeds: [], totalParsed: 0, totalNew: 0, errors: [] };
+
   for (const feed of FEEDS) {
+    const stat = { name: feed.name, parsed: 0, new: 0, status: "ok" };
     try {
       const response = await fetch(feed.url, {
-        headers: { "User-Agent": "RF-Intelligence/0.1 (+daily research digest)" }
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; RF-Intelligence/1.0; +daily research digest)",
+          "Accept": "application/rss+xml, application/xml, text/xml, */*"
+        }
       });
-      if (!response.ok) continue;
+      if (!response.ok) {
+        stat.status = `HTTP ${response.status}`;
+        report.errors.push(`${feed.name}: HTTP ${response.status}`);
+        report.feeds.push(stat);
+        continue;
+      }
       const xml = await response.text();
-      const entries = parseFeed(xml).slice(0, 12);
+      const entries = parseFeed(xml).slice(0, feed.maxItems || 6);
+      stat.parsed = entries.length;
+      report.totalParsed += entries.length;
+      if (!entries.length) {
+        stat.status = "empty/unparsable";
+        report.errors.push(`${feed.name}: 未解析出条目`);
+        report.feeds.push(stat);
+        continue;
+      }
+
+      // 试跑模式：只验证源可达与解析结果，不调 AI、不写库、不花钱
+      if (dry) {
+        stat.sample = entries[0].title;
+        report.feeds.push(stat);
+        continue;
+      }
 
       for (const entry of entries) {
         if (!entry.title || !entry.link) continue;
         const exists = await env.DB.prepare("SELECT id FROM news WHERE url = ?").bind(entry.link).first();
-        if (exists) continue; // 已收录（含 ai_failed）就跳过，避免每次 cron 重复调用 DeepSeek 花钱
+        if (exists) continue; // 已收录（含 ai_failed）就跳过，避免每次重复调用 DeepSeek 花钱
 
         const analysis = await analyzeWithDeepSeek(entry, feed.name, env);
         await env.DB.prepare(`
@@ -88,7 +131,9 @@ async function collectAndAnalyze(env) {
            technical_analysis, industry_impact, importance, ai_model, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
-          feed.name, entry.title, entry.link, entry.publishedAt || null,
+          feed.name, entry.title, entry.link,
+          // ETSI 有真实 pubDate；C114 无发布时间则留 null，前端按收录时间展示，不伪造发布日期
+          entry.publishedAt || null,
           new Date().toISOString(), analysis.category || "行业动态",
           analysis.summary || entry.description || "",
           analysis.technical_analysis || "",
@@ -97,11 +142,17 @@ async function collectAndAnalyze(env) {
           env.DEEPSEEK_MODEL || "deepseek-chat",
           analysis.status || "analyzed"
         ).run();
+        stat.new += 1;
       }
+      report.totalNew += stat.new;
+      report.feeds.push(stat);
     } catch (err) {
-      console.error("Feed failed:", feed.name, String(err));
+      stat.status = "error: " + String(err);
+      report.errors.push(`${feed.name}: ${String(err)}`);
+      report.feeds.push(stat);
     }
   }
+  return report;
 }
 
 function parseFeed(xml) {
@@ -109,10 +160,20 @@ function parseFeed(xml) {
   return blocks.map(block => {
     const title = clean(getTag(block, "title"));
     const link = getTag(block, "link") || (block.match(/<link[^>]+href=["']([^"']+)/i) || [])[1] || "";
-    const publishedAt = getTag(block, "pubDate") || getTag(block, "published") || getTag(block, "updated");
+    // 兼容 pubDate(RSS) / published / updated(Atom) / dc:date 等字段
+    const rawDate = getTag(block, "pubDate") || getTag(block, "published") ||
+                    getTag(block, "updated") || getTag(block, "dc:date");
+    const publishedAt = normalizeDate(rawDate);
     const description = clean(getTag(block, "description") || getTag(block, "summary") || "");
     return { title, link: decode(link), publishedAt, description };
   });
+}
+// RSS 的 pubDate 常为 RFC822（如 "Thu, 05 Nov 2026 09:31:41 +0000"），
+// SQLite datetime() 无法解析。统一转成 ISO 8601（UTC），否则 days 过滤/排序会失效。
+function normalizeDate(s) {
+  if (!s) return "";
+  const t = Date.parse(s.trim());
+  return Number.isNaN(t) ? "" : new Date(t).toISOString();
 }
 function getTag(s, tag) {
   const m = s.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
